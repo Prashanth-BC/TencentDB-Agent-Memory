@@ -63,8 +63,38 @@ calling a hosted API.
   | "offload-l15" | "offload-l2"`.
 - `MemoryCore/src/services/pipeline-worker.ts` — `case "flush"` falls back to `executeL1`.
 
+## Codebase-memory trace (this session) — the actual wiring, more concrete than the plan above
+- **`TdaiCore.wirePipelineRunners()`** (`MemoryCore/src/core/tdai-core.ts:671-776`) is the real
+  decision point for step 1. It already has a config-flag-over-hostType pattern in production:
+  `useStandaloneRunner = cfg.llm.enabled || hostAdapter.hostType !== "openclaw"`. The existing
+  code comments explicitly say `hostType` branching "should be rare" and documents a case
+  (`provider=proxy`) where `cfg.llm` must override the host's own runner factory. This is
+  precedent for **option 2** (a config flag, e.g. `MEMORY_LLM_MODE=sampling`) over adding a new
+  `hostType: "mcp"` — follow the grain of the existing code rather than widening the `hostType`
+  union.
+- Inside `wirePipelineRunners()`, the chosen `runnerFactory` is wrapped by
+  `MetricTrackingRunnerFactory` (non-intrusive Kafka credit reporting, no-op without Kafka
+  config) before `createRunner({ enableTools: false })` (L1) and
+  `createRunner({ enableTools: true })` (L2/L3) are called. This decorator is factory-agnostic,
+  so a new `SamplingLLMRunnerFactory` gets instrumentation for free — no changes needed there.
+- **Second, independent integration point not in the original plan**: `TdaiCore.buildSkillLlmRunner()`
+  (`MemoryCore/src/core/tdai-core.ts:992-1025`) constructs a `StandaloneLLMRunner` **directly**,
+  bypassing `LLMRunnerFactory`/`HostAdapter` entirely, for skill extraction (always
+  `enableTools: true`). Any sampling-mode work must special-case this path too, not just the
+  factory override in `wirePipelineRunners()` — otherwise skill extraction keeps using
+  `MEMORY_LLM_API_KEY` even when sampling mode is on everywhere else.
+- `StandaloneHostAdapter.constructor` (`MemoryCore/src/adapters/standalone/host-adapter.ts:47-57`)
+  always builds a `StandaloneLLMRunnerFactory` as the adapter's default `runnerFactory` — the
+  fallback `wirePipelineRunners()` uses when no override applies.
+- Net: a sampling-mode implementation touches at least 3 call sites
+  (`wirePipelineRunners`, `buildSkillLlmRunner`, `StandaloneHostAdapter.constructor`), not just
+  "swap the factory."
+
 ## Not yet decided (ask next session)
-- hostType vs config-flag approach (step 1).
+- hostType vs config-flag approach (step 1) — leaning config-flag per the trace above, confirm
+  before coding.
+- How `buildSkillLlmRunner`'s direct `StandaloneLLMRunner` construction should pick up sampling
+  mode (new finding — needs its own decision, not just "wherever the factory is used").
 - Whether to also port their `team`/`user`/ACL model (from `feat/server_team`) into fornix
   separately — this was a side-thread of the same conversation, unrelated to the LLMRunner
   work, don't conflate the two.
